@@ -1,6 +1,28 @@
 -- Filesystem polling runs in LoopAsync.  It must never access Unreal Engine
 -- objects directly because that work may run while a player is loading.
 
+-- The listener can resend an event when it sees the queue file before the
+-- acknowledgement write completes.  Claim each event ID before scheduling it
+-- so one donation can produce at most one broadcast and one reward action.
+local recentDonationEventIds = {}
+local recentDonationEventOrder = {}
+local maxRecentDonationEventIds = 4096
+
+local function claimDonationEvent(eventId)
+    if recentDonationEventIds[eventId] then
+        return false
+    end
+
+    recentDonationEventIds[eventId] = true
+    table.insert(recentDonationEventOrder, eventId)
+
+    if #recentDonationEventOrder > maxRecentDonationEventIds then
+        local expiredEventId = table.remove(recentDonationEventOrder, 1)
+        recentDonationEventIds[expiredEventId] = nil
+    end
+    return true
+end
+
 function processDonation(playerId, amount, eventId)
     local playerUid = { A = playerId, B = 0, C = 0, D = 0 }
     if not ensureGameReferences() then
@@ -16,6 +38,11 @@ function processDonation(playerId, amount, eventId)
 end
 
 function dispatchDonation(playerId, amount, eventId)
+    if not claimDonationEvent(eventId) then
+        log("duplicate donation event ignored: " .. eventId)
+        return
+    end
+
     ExecuteInGameThread(function()
         processDonation(playerId, amount, eventId)
     end)
