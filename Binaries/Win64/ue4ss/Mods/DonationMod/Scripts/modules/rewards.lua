@@ -73,8 +73,12 @@ function dropRandomPartyPal(playerUid, onComplete)
         return false
     end
 
+    -- GetOtomoCount reports how many Pals are assigned, not the highest
+    -- occupied party-slot index.  A party can have gaps, so inspect all five
+    -- actual party slots instead of only 0..(count - 1).
     local occupiedSlots = {}
-    for slotIndex = 0, partyCount - 1 do
+    local partySlotCount = 5
+    for slotIndex = 0, partySlotCount - 1 do
         local handleOk, handle = pcall(function()
             return holder:GetOtomoIndividualHandle(slotIndex)
         end)
@@ -92,13 +96,15 @@ function dropRandomPartyPal(playerUid, onComplete)
         end
     end
 
-    if #occupiedSlots == 0 then
+    -- Keep one Pal in the party.  Besides being less punishing, this avoids
+    -- the game's server RPC refusing a drop when it would empty the party.
+    if #occupiedSlots < 2 then
+        log("팰 드롭 실패: 마지막 한 마리는 보호됩니다.")
         log("팰 드롭 실패: 드롭 가능한 파티 팰을 찾지 못했습니다.")
         return false
     end
 
     local selected = occupiedSlots[math.random(1, #occupiedSlots)]
-    local isLastPartyPal = #occupiedSlots == 1
     local transmitter = playerController.Transmitter
     local networkPlayer = transmitter ~= nil and transmitter.Player or nil
     if networkPlayer == nil or not networkPlayer:IsValid() then
@@ -112,7 +118,7 @@ function dropRandomPartyPal(playerUid, onComplete)
     pendingPalDropSlots[slotKey] = true
 
     -- 게임의 기본 팰 드롭 RPC를 사용합니다. 직접 저장 데이터를 지우지 않습니다.
-    -- 0.75초 뒤 슬롯이 실제로 비워졌는지 검사하고, 그대로면 한 번만 재시도합니다.
+    -- 1초 뒤 슬롯이 실제로 비워졌는지 검사하고, 그대로면 최대 두 번 더 재시도합니다.
     local attempts = 0
     local function requestAndVerify()
         attempts = attempts + 1
@@ -128,53 +134,19 @@ function dropRandomPartyPal(playerUid, onComplete)
             return
         end
 
-        ExecuteWithDelay(750, function()
+        ExecuteWithDelay(1000, function()
             if not isSelectedHandleStillInSlot(holder, selected.index, selected.handle) then
                 pendingPalDropSlots[slotKey] = nil
                 log(string.format("팰 드롭 완료 확인: %s / 슬롯 %d / %s", playerName, selected.index + 1, palName))
                 if onComplete ~= nil then
                     onComplete(true, playerName, palName)
                 end
-            elseif attempts < 2 then
+            elseif attempts < 3 then
                 log(string.format("팰 드롭 슬롯이 아직 남아 있어 재시도합니다: %s / 슬롯 %d", playerName, selected.index + 1))
                 requestAndVerify()
-            elseif isLastPartyPal then
-                -- 게임 기본 RPC는 마지막 한 마리를 보호합니다. 이 경우에만
-                -- 파티 홀더의 제거 함수를 사용해 마지막 팰도 파티에서 강제 분리합니다.
-                log(string.format("마지막 팰 보호 규칙을 우회해 강제 분리합니다: %s / 슬롯 %d", playerName, selected.index + 1))
-                pcall(function()
-                    holder:InactivateCurrentOtomo()
-                end)
-
-                local forceOk, forceErr = pcall(function()
-                    holder:RemovePalFromParty(selected.handle)
-                end)
-                if not forceOk then
-                    pendingPalDropSlots[slotKey] = nil
-                    log("마지막 팰 강제 분리에 실패했습니다: " .. tostring(forceErr))
-                    if onComplete ~= nil then
-                        onComplete(false, playerName, palName)
-                    end
-                    return
-                end
-
-                ExecuteWithDelay(250, function()
-                    pendingPalDropSlots[slotKey] = nil
-                    if not isSelectedHandleStillInSlot(holder, selected.index, selected.handle) then
-                        log(string.format("마지막 팰 강제 분리 완료 확인: %s / 슬롯 %d / %s", playerName, selected.index + 1, palName))
-                        if onComplete ~= nil then
-                            onComplete(true, playerName, palName)
-                        end
-                    else
-                        log(string.format("마지막 팰 강제 분리 실패: 슬롯이 비워지지 않았습니다: %s / 슬롯 %d", playerName, selected.index + 1))
-                        if onComplete ~= nil then
-                            onComplete(false, playerName, palName)
-                        end
-                    end
-                end)
             else
                 pendingPalDropSlots[slotKey] = nil
-                log(string.format("팰 드롭 실패: 두 번 요청했지만 슬롯이 비워지지 않았습니다: %s / 슬롯 %d", playerName, selected.index + 1))
+                log(string.format("팰 드롭 실패: 세 번 요청했지만 슬롯이 비워지지 않았습니다: %s / 슬롯 %d", playerName, selected.index + 1))
                 if onComplete ~= nil then
                     onComplete(false, playerName, palName)
                 end
