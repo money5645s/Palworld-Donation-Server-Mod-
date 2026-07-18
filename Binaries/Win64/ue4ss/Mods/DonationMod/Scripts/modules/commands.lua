@@ -20,7 +20,7 @@ local function dumpCombatFunctions(label, object)
 end
 
 -- CHZZK listener commands:
---   !czr <channel id>  register
+--   !czr <player name> <channel id>  register a player's channel
 --   !czs               show connection status
 --   !czu               unregister
 -- The former long names remain as compatibility aliases.
@@ -32,6 +32,32 @@ local chzzkCommandActions = {
     chzzkstatus = "status",
     chzzkunregister = "unregister",
 }
+
+local function normalizePlayerSelector(selector)
+    selector = (selector or ""):match("^%s*(.-)%s*$")
+    local firstCharacter = selector:sub(1, 1)
+    local lastCharacter = selector:sub(-1)
+    if #selector >= 2
+        and ((firstCharacter == "\"" and lastCharacter == "\"")
+            or (firstCharacter == "'" and lastCharacter == "'")) then
+        return selector:sub(2, -2)
+    end
+    return selector
+end
+
+-- Splits "player name final-value" at the final whitespace-separated token.
+-- Therefore player names may contain spaces, with or without surrounding quotes.
+local function parseNamedFinalArgument(value)
+    local selector, finalValue = (value or ""):match("^(.-)%s+(%S+)%s*$")
+    if selector == nil then
+        return nil, nil
+    end
+    selector = normalizePlayerSelector(selector)
+    if selector == "" then
+        return nil, finalValue
+    end
+    return selector, finalValue
+end
 
 local donationChatCommandHookOk, donationChatCommandHookErr = pcall(function()
     RegisterHook("/Script/Pal.PalGameStateInGame:BroadcastChatMessage", function(_, ChatMessage)
@@ -56,13 +82,40 @@ local donationChatCommandHookOk, donationChatCommandHookErr = pcall(function()
 
         if chzzkAction ~= nil then
             local action = chzzkAction
-            local playerName = playerState.PlayerNamePrivate:ToString()
-            local requestId, requestErr = queueStreamerRegistrationRequest(action, playerUid, playerName, value)
+            local targetPlayerUid = playerUid
+            local targetPlayerName = playerState.PlayerNamePrivate:ToString()
+            local channelInput = value
+
+            if action == "register" then
+                local targetSelector, parsedChannelInput = parseNamedFinalArgument(value)
+                if targetSelector == nil or parsedChannelInput == nil then
+                    sendSystemToPlayer(playerUid, "[CHZZK] 사용법: !czr 플레이어이름 채널아이디")
+                    return
+                end
+
+                targetPlayerUid = findPlayer(targetSelector)
+                if targetPlayerUid == nil then
+                    sendSystemToPlayer(playerUid, "[CHZZK] 대상 플레이어를 찾지 못했습니다: " .. targetSelector)
+                    log("CHZZK 등록 명령 거부: 대상 플레이어를 찾지 못했습니다: " .. targetSelector)
+                    return
+                end
+
+                local targetPlayerState = findPlayerStateByUid(targetPlayerUid)
+                if targetPlayerState == nil then
+                    sendSystemToPlayer(playerUid, "[CHZZK] 대상 플레이어 정보를 찾지 못했습니다: " .. targetSelector)
+                    return
+                end
+
+                targetPlayerName = targetPlayerState.PlayerNamePrivate:ToString()
+                channelInput = parsedChannelInput
+            end
+
+            local requestId, requestErr = queueStreamerRegistrationRequest(action, targetPlayerUid, targetPlayerName, channelInput)
             if requestId == nil then
                 log("CHZZK 등록 요청에 실패했습니다: " .. tostring(requestErr))
                 sendSystemToPlayer(playerUid, "[CHZZK] 채널 리스너에 연결할 수 없습니다. 리스너 창을 확인하세요.")
             elseif action == "register" then
-                sendSystemToPlayer(playerUid, "[CHZZK] 채널 등록을 요청했습니다. 연결 결과를 채팅에서 확인하세요.")
+                sendSystemToPlayer(playerUid, "[CHZZK] " .. targetPlayerName .. "님의 채널 등록을 요청했습니다. 연결 결과를 채팅에서 확인하세요.")
             elseif action == "status" then
                 sendSystemToPlayer(playerUid, "[CHZZK] 채널 연결 상태를 확인하고 있습니다...")
             else
@@ -94,30 +147,17 @@ local donationChatCommandHookOk, donationChatCommandHookErr = pcall(function()
         -- The amount is parsed from the final token so player names may
         -- contain spaces.  Quoted names are also accepted.
         local targetPlayerUid = playerUid
-        local targetSelector, amountText = value:match("^(.-)%s+(%d+)%s*$")
+        local targetSelector, amountText = parseNamedFinalArgument(value)
         local amount = nil
 
         if targetSelector ~= nil then
-            targetSelector = targetSelector:match("^%s*(.-)%s*$")
-            if targetSelector == "" then
-                amount = tonumber(amountText)
-            else
-                local firstCharacter = targetSelector:sub(1, 1)
-                local lastCharacter = targetSelector:sub(-1)
-                if #targetSelector >= 2
-                    and ((firstCharacter == "\"" and lastCharacter == "\"")
-                        or (firstCharacter == "'" and lastCharacter == "'")) then
-                    targetSelector = targetSelector:sub(2, -2)
-                end
-
-                targetPlayerUid = findPlayer(targetSelector)
-                if targetPlayerUid == nil then
-                    sendSystemToPlayer(playerUid, "[후원] 대상 플레이어를 찾지 못했습니다: " .. targetSelector)
-                    log("후원 테스트 명령 거부: 대상 플레이어를 찾지 못했습니다: " .. targetSelector)
-                    return
-                end
-                amount = tonumber(amountText)
+            targetPlayerUid = findPlayer(targetSelector)
+            if targetPlayerUid == nil then
+                sendSystemToPlayer(playerUid, "[후원] 대상 플레이어를 찾지 못했습니다: " .. targetSelector)
+                log("후원 테스트 명령 거부: 대상 플레이어를 찾지 못했습니다: " .. targetSelector)
+                return
             end
+            amount = tonumber(amountText)
         else
             amount = tonumber(value)
         end
