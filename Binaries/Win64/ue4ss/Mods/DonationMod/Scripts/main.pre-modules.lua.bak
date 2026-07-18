@@ -1,0 +1,827 @@
+local ModActor = nil
+local PalUtility = nil
+local World = nil
+local pendingDonations = {}
+
+local scriptSource = debug.getinfo(1, "S").source or ""
+local scriptPath = scriptSource:sub(1, 1) == "@" and scriptSource:sub(2) or scriptSource
+local scriptDirectory = scriptPath:match("^(.*)[/\\\\]") or "."
+local donationQueuePath = scriptDirectory .. "\\donations.queue"
+local playerStatusPath = scriptDirectory .. "\\players.status"
+local streamerRegistrationRequestPath = scriptDirectory .. "\\streamer-registration.requests"
+local streamerRegistrationResponsePath = scriptDirectory .. "\\streamer-registration.responses"
+local bindingDumpRequestPath = scriptDirectory .. "\\dump-bindings.request"
+local donationQueueOffset = nil
+local streamerRegistrationResponseOffset = nil
+local playerStatusPollCount = 0
+local streamerRegistrationSequence = 0
+
+-- Seed the random generator
+math.randomseed(os.time())
+
+local function log(message)
+    print(string.format("[DonationMod] %s\n", message))
+end
+
+local function translateGuid(Userdata)
+    local self = {}
+    self.A = Userdata.A
+    self.B = Userdata.B
+    self.C = Userdata.C
+    self.D = Userdata.D
+    return self
+end
+
+local function ensureGameReferences()
+    if PalUtility == nil or not PalUtility:IsValid() then
+        PalUtility = StaticFindObject("/Script/Pal.Default__PalUtility")
+    end
+    if World == nil or not World:IsValid() then
+        World = FindFirstOf("World")
+    end
+    return PalUtility ~= nil and PalUtility:IsValid() and World ~= nil and World:IsValid()
+end
+
+local function findPlayerStateByUid(playerUid)
+    local players = FindAllOf("PalPlayerController") or {}
+    for _, player in pairs(players) do
+        local playerState = player:GetPalPlayerState()
+        if playerState ~= nil and playerState:IsValid() and playerState.PlayerUId.A == playerUid.A then
+            return playerState, player
+        end
+    end
+    return nil, nil
+end
+
+local function giveItemToPlayer(playerUid, itemId, count)
+    local playerState = findPlayerStateByUid(playerUid)
+    if playerState == nil then
+        log("Could not find the target player for item delivery.")
+        return false
+    end
+
+    local inventory = playerState:GetInventoryData()
+    if inventory == nil or not inventory:IsValid() then
+        log("Could not access the target player's inventory.")
+        return false
+    end
+
+    -- Palworld's current function has a fourth `LogDelay` float argument.
+    -- Omitting it makes UE4SS reject the call before the item is added.
+    local ok, resultOrErr = pcall(function()
+        return inventory:AddItem_ServerInternal(FName(itemId), count, false, 0.0)
+    end)
+    if not ok then
+        log("Item delivery failed: " .. tostring(resultOrErr))
+        return false
+    end
+    log(string.format("Delivered %s x%d to the target player (result: %s).", itemId, count, tostring(resultOrErr)))
+    return true
+end
+
+local function broadcastToPlayers(message)
+    if not ensureGameReferences() then
+        log("Could not broadcast because the server world is not ready.")
+        return false
+    end
+
+    local delivered = false
+    local players = FindAllOf("PalPlayerController") or {}
+    for _, player in pairs(players) do
+        local playerState = player:GetPalPlayerState()
+        if playerState ~= nil and playerState:IsValid() then
+            local ok, err = pcall(function()
+                PalUtility:SendSystemToPlayerChat(World, message, translateGuid(playerState.PlayerUId))
+            end)
+            if not ok then
+                log("Broadcast delivery failed: " .. tostring(err))
+            else
+                delivered = true
+            end
+        end
+    end
+    return delivered
+end
+
+local function sendSystemToPlayer(playerUid, message)
+    if not ensureGameReferences() then
+        return false
+    end
+
+    local ok, err = pcall(function()
+        PalUtility:SendSystemToPlayerChat(World, message, playerUid)
+    end)
+    if not ok then
+        log("System chat delivery failed: " .. tostring(err))
+        return false
+    end
+    return true
+end
+
+local function queueStreamerRegistrationRequest(action, playerUid, playerName, channelInput)
+    streamerRegistrationSequence = streamerRegistrationSequence + 1
+    local requestId = string.format("streamer-%d-%d-%d", os.time(), playerUid.A, streamerRegistrationSequence)
+    local safeName = tostring(playerName or ""):gsub("[\t\r\n]", " ")
+    local safeInput = tostring(channelInput or ""):gsub("[\t\r\n]", " ")
+    local requestFile = io.open(streamerRegistrationRequestPath, "a")
+    if requestFile == nil then
+        return nil, "Could not write streamer registration request."
+    end
+
+    requestFile:write(requestId, "\t", action, "\t", tostring(playerUid.A), "\t", safeName, "\t", safeInput, "\n")
+    requestFile:close()
+    return requestId, nil
+end
+
+local DirectDonationActor = {}
+
+function DirectDonationActor:IsValid()
+    return true
+end
+
+function DirectDonationActor:GiveItem(playerUid, itemId, count)
+    local itemName = itemId
+    if type(itemId) ~= "string" then
+        local ok, value = pcall(function()
+            return itemId:ToString()
+        end)
+        if not ok then
+            log("Could not convert the item name for delivery.")
+            return false
+        end
+        itemName = value
+    end
+    return giveItemToPlayer(playerUid, itemName, count)
+end
+
+function DirectDonationActor:Broadcast(message)
+    return broadcastToPlayers(message)
+end
+
+-- The original project expects a Blueprint actor.  This proxy keeps its
+-- existing reward rules working while routing them through server-side Lua.
+ModActor = DirectDonationActor
+
+local function findPlayer(Id)
+    local result = PalUtility:GetPlayerUIdByString(World, Id);
+    if result ~= nil and result.A ~= 0 then
+        return result
+    end
+    local Players = FindAllOf("PalPlayerController")
+    for _, player in pairs(Players) do
+        local playerState = player:GetPalPlayerState()
+        if playerState ~= nil and playerState:IsValid() then
+            local uid = string.lower(string.sub(string.format("%016x", playerState.PlayerUId.A), -8))
+            if string.lower(Id) == uid or string.lower(Id) == (uid .. "000000000000000000000000") then
+                return playerState.PlayerUId
+            end
+            if string.lower(Id) == string.lower(playerState.PlayerNamePrivate:ToString()) then
+                return playerState.PlayerUId
+            end
+        end
+    end
+    return nil
+end
+
+-- 1. 소모품 룰렛 아이템 선택
+local function getRandomConsumable()
+    local rand = math.random(1, 100)
+    local grade = ""
+    local items = {}
+    
+    if rand <= 5 then
+        grade = "잭팟(5%)"
+        items = {
+            { id = "PalSphere_Tera", count = 10, name = "하이퍼 스피어" },
+            { id = "ExplosiveCore", count = 3, name = "포식자 코어" },
+            { id = "AncientParts", count = 5, name = "고대 문명 부품" },
+            { id = "CrudeOil", count = 20, name = "석유" },
+            { id = "Cake", count = 5, name = "케이크" }
+        }
+    elseif rand <= 30 then
+        grade = "레어(25%)"
+        items = {
+            { id = "PalSphere_Mega", count = 15, name = "메가 스피어" },
+            { id = "PalSphere_Giga", count = 10, name = "기가 스피어" },
+            { id = "HighQualityPalOil", count = 15, name = "고급 팰 기름" },
+            { id = "FireOrgan", count = 20, name = "발화 기관" },
+            { id = "ElectricOrgan", count = 20, name = "전기 기관" },
+            { id = "IceOrgan", count = 20, name = "빙결 기관" },
+            { id = "VenomGland", count = 20, name = "독샘" },
+            { id = "Coal", count = 50, name = "석탄" },
+            { id = "Quartz", count = 50, name = "순수한 석영" }
+        }
+    else
+        grade = "일반(70%)"
+        items = {
+            { id = "Baked_Berry", count = 30, name = "구운 열매" },
+            { id = "Bread", count = 20, name = "빵" },
+            { id = "PalSphere", count = 20, name = "팰 스피어" },
+            { id = "PalFluid", count = 15, name = "펠의 체액" },
+            { id = "Leather", count = 30, name = "가죽" },
+            { id = "Bone", count = 30, name = "뼈" },
+            { id = "Ore", count = 50, name = "금속 광석" }
+        }
+    end
+    
+    local selected = items[math.random(1, #items)]
+    return selected, grade
+end
+
+-- 2. 팰 소환 룰렛 팰 선택
+local function getRandomPal()
+    local rand = math.random(1, 100)
+    local grade = ""
+    local pals = {}
+    
+    if rand <= 5 then
+        grade = "잭팟(5%)"
+        pals = {
+            { id = "Helzephyr", name = "헬가루다" },
+            { id = "Astegon", name = "라바드래곤" },
+            { id = "Menasting", name = "데스 스팅" },
+            { id = "Anubis", name = "아누비스" },
+            { id = "Orserk", name = "전룡맨" }
+        }
+    elseif rand <= 30 then
+        grade = "레어(25%)"
+        pals = {
+            { id = "Kitsun", name = "마그피스" },
+            { id = "Broncherry_Water", name = "아주리비" },
+            { id = "Foxcicle", name = "백랑이" },
+            { id = "Blazehowl", name = "만티파이어" },
+            { id = "Shadowbeak", name = "시니에노" },
+            { id = "Relaxaurus", name = "헤로롱" },
+            { id = "Relaxaurus_Electric", name = "핑피롱" },
+            { id = "Mammorest", name = "라브라돈" },
+            { id = "Broncherry", name = "스프라돈" },
+            { id = "Petallia", name = "플로리나" },
+            { id = "Reptyro", name = "볼카노" },
+            { id = "Reptyro_Ice", name = "프로스카노" },
+            { id = "Kingpaca", name = "킹파카" },
+            { id = "Kingpaca_Ice", name = "블루파카" },
+            { id = "Quivern", name = "페스키" }
+        }
+    else
+        grade = "일반(70%)"
+        pals = {
+            { id = "FlameBanshee", name = "헬고트" },
+            { id = "FlameBanshee_Dark", name = "아비스고트" },
+            { id = "Vixy", name = "귀요비" },
+            { id = "Rooby", name = "불페르노" },
+            { id = "Dumud", name = "도도롱" },
+            { id = "Cawgnito", name = "마스크로우" },
+            { id = "Leezpunk", name = "도마맨" },
+            { id = "Celaray", name = "칠리자드" },
+            { id = "Swee", name = "달서니" },
+            { id = "Galeclaw", name = "질풍수리" },
+            { id = "Robinquill", name = "로빈몽" },
+            { id = "Direhowl", name = "산도로" },
+            { id = "Gorirat", name = "고릴레이지" },
+            { id = "Beegarde", name = "비나이트" },
+            { id = "Elizabee", name = "퀸비나" },
+            { id = "Grintale", name = "소름냥이" },
+            { id = "Swee", name = "모프링" },
+            { id = "Sweepa", name = "모프킹" },
+            { id = "Chillet", name = "베비뇽" },
+            { id = "Rayhound", name = "썬더콘" },
+            { id = "Cryolinx", name = "빙호" },
+            { id = "Pyrin", name = "파이린" },
+            { id = "Pyrin_Noct", name = "사라블랙" },
+            { id = "Reindrix", name = "얼음사슴" },
+            { id = "Univolt", name = "썬도그" },
+            { id = "Arsox", name = "불이리" },
+            { id = "Sparkit", name = "썬더키드" },
+            { id = "Lunaris", name = "루나리스" },
+            { id = "Dinossom", name = "플로라디노" },
+            { id = "Dinossom_Lux", name = "찌르르디노" },
+            { id = "Caprity", name = "씨무기" },
+            { id = "Elphidran", name = "스너펜트" },
+            { id = "Maraith", name = "고스호스" },
+            { id = "Digtoise", name = "드릴북이" },
+            { id = "Tombat", name = "냥뱃" },
+            { id = "Lovander", name = "핑크뇽" },
+            { id = "Ribbuny", name = "라비" },
+            { id = "Vanwyrm", name = "버드래곤" },
+            { id = "Vanwyrm_Crystal", name = "시로카바네" },
+            { id = "Bushi", name = "불무사" },
+            { id = "Beakon", name = "라이버드" },
+            { id = "Ragnahawk", name = "적토조" },
+            { id = "Katress", name = "캐티메이지" },
+            { id = "Wixen", name = "마호" },
+            { id = "Tanzee", name = "초토리" },
+            { id = "Vaelet", name = "비오레타" },
+            { id = "Sibelyx", name = "실키누" },
+            { id = "Felbat", name = "실피아" },
+            { id = "Fenglope", name = "실티아" },
+            { id = "Kelpsey", name = "켈시" }
+        }
+    end
+    
+    local selected = pals[math.random(1, #pals)]
+    return selected, grade
+end
+
+-- 3. 플레이어 즉사 처리
+local function killPlayer(playerUid)
+    local Players = FindAllOf("PalPlayerController")
+    for _, player in pairs(Players) do
+        local playerState = player:GetPalPlayerState()
+        if playerState ~= nil and playerState:IsValid() then
+            if playerState.PlayerUId.A == playerUid.A then
+                local pawn = player:GetPawn()
+                if pawn ~= nil and pawn:IsValid() then
+                    pawn.CharacterParameterComponent.HP.Value = 0
+                    log("Killed player: " .. playerState.PlayerNamePrivate:ToString())
+                    return playerState.PlayerNamePrivate:ToString()
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- 4. 팰 소환 처리
+local function spawnPalForPlayer(playerUid, palId)
+    local palIdFName = FName(palId)
+    local success = false
+    
+    -- ModActor의 블루프린트 내 팰 소환 함수 리플렉션 호출 시도
+    pcall(function()
+        if ModActor ~= nil and ModActor:IsValid() and ModActor.SummonPal ~= nil then
+            ModActor:SummonPal(playerUid, palIdFName)
+            success = true
+        elseif ModActor ~= nil and ModActor:IsValid() and ModActor.SpawnPal ~= nil then
+            ModActor:SpawnPal(playerUid, palIdFName)
+            success = true
+        elseif ModActor ~= nil and ModActor:IsValid() and ModActor.SpawnMonster ~= nil then
+            ModActor:SpawnMonster(playerUid, palIdFName)
+            success = true
+        end
+    end)
+    
+    if success then
+        return true
+    end
+    
+    -- 직접 스폰 시도 (ModActor에 함수가 없을 경우)
+    local Players = FindAllOf("PalPlayerController")
+    for _, player in pairs(Players) do
+        local playerState = player:GetPalPlayerState()
+        if playerState ~= nil and playerState:IsValid() then
+            if playerState.PlayerUId.A == playerUid.A then
+                local pawn = player:GetPawn()
+                if pawn ~= nil and pawn:IsValid() then
+                    local loc = pawn:K2_GetActorLocation()
+                    local rot = pawn:K2_GetActorRotation()
+                    
+                    pcall(function()
+                        if PalUtility ~= nil then
+                            -- 30레벨 몬스터로 스폰 시도
+                            PalUtility:SpawnMonsterType(World, palIdFName, 1, 30, loc, rot)
+                            success = true
+                        end
+                    end)
+                end
+            end
+        end
+    end
+    return success
+end
+
+-- 5. 후원 보상 비즈니스 로직 처리
+local function handleDonationRule(playerUid, amount)
+    log(string.format("Processing donation rules for UID.A=%d, Amount=%d", playerUid.A, amount))
+    
+    -- 플레이어 찾기
+    local targetName = "플레이어"
+    local Players = FindAllOf("PalPlayerController")
+    for _, player in pairs(Players) do
+        local playerState = player:GetPalPlayerState()
+        if playerState ~= nil and playerState:IsValid() then
+            if playerState.PlayerUId.A == playerUid.A then
+                targetName = playerState.PlayerNamePrivate:ToString()
+                break
+            end
+        end
+    end
+
+    if amount == 1000 then
+        -- 소모품 룰렛
+        local item, grade = getRandomConsumable()
+        log(string.format("Roulette (Consumable) selected: %s (%s) x%d", item.name, grade, item.count))
+        
+        if giveItemToPlayer(playerUid, item.id, item.count) then
+            ModActor:Broadcast(string.format("[후원 보상] [%s]님이 1,000원 소모품 룰렛에서 %s 등급 [%s %d개]를 획득했습니다!", targetName, grade, item.name, item.count))
+        else
+            log("Consumable roulette failed; reward broadcast was suppressed.")
+        end
+        
+    elseif amount == 10000 then
+        -- 팰 소환 룰렛
+        local pal, grade = getRandomPal()
+        log(string.format("Roulette (Pal) selected: %s (%s)", pal.name, grade))
+        
+        local spawned = spawnPalForPlayer(playerUid, pal.id)
+        if spawned then
+            ModActor:Broadcast(string.format("[후원 보상] [%s]님 위치에 10,000원 팰 소환 룰렛에서 %s 등급 [%s]이 소환되었습니다!", targetName, grade, pal.name))
+        else
+            log("Failed to spawn pal: " .. pal.id)
+        end
+        
+    elseif amount == 100000 then
+        -- 10만원 즉사
+        local killedName = killPlayer(playerUid)
+        if killedName ~= nil then
+            ModActor:Broadcast(string.format("[후원 피격] [%s]님이 100,000원 후원 즉사 보상으로 사망 처리되었습니다!", killedName))
+        else
+            log("Failed to kill player UID.A: " .. playerUid.A)
+        end
+    else
+        log("Unhandled donation amount: " .. amount)
+    end
+end
+
+local function dumpCombatFunctions(label, object)
+    if object == nil or not object:IsValid() then
+        log(label .. " is unavailable.")
+        return
+    end
+
+    local class = object:GetClass()
+    class:ForEachFunction(function(func)
+        local name = func:GetFName():ToString()
+        local lowerName = name:lower()
+        if lowerName:find("die", 1, true)
+            or lowerName:find("death", 1, true)
+            or lowerName:find("kill", 1, true)
+            or lowerName:find("damage", 1, true)
+            or lowerName:find("health", 1, true)
+            or lowerName:find("hp", 1, true) then
+            log(label .. " candidate: " .. name)
+        end
+    end)
+end
+
+local donationChatCommandHookOk, donationChatCommandHookErr = pcall(function()
+    RegisterHook("/Script/Pal.PalGameStateInGame:BroadcastChatMessage", function(_, ChatMessage)
+        local chat = ChatMessage:get()
+        local message = chat.Message:ToString()
+        local command, value = message:match("^!(%S+)%s*(.*)$")
+        local normalizedCommand = command and command:lower()
+        if normalizedCommand ~= "donationtest"
+            and normalizedCommand ~= "donationdebug"
+            and normalizedCommand ~= "chzzkregister"
+            and normalizedCommand ~= "chzzkstatus"
+            and normalizedCommand ~= "chzzkunregister" then
+            return
+        end
+
+        local playerUid = translateGuid(chat.SenderPlayerUId)
+        local playerState = findPlayerStateByUid(playerUid)
+        if playerState == nil then
+            log("Donation command rejected: sender could not be resolved.")
+            return
+        end
+
+        if normalizedCommand == "chzzkregister"
+            or normalizedCommand == "chzzkstatus"
+            or normalizedCommand == "chzzkunregister" then
+            local action = normalizedCommand == "chzzkregister" and "register"
+                or (normalizedCommand == "chzzkstatus" and "status" or "unregister")
+            local playerName = playerState.PlayerNamePrivate:ToString()
+            local requestId, requestErr = queueStreamerRegistrationRequest(action, playerUid, playerName, value)
+            if requestId == nil then
+                log("CHZZK registration request failed: " .. tostring(requestErr))
+                sendSystemToPlayer(playerUid, "[CHZZK] Could not contact the channel listener. Check the server listener window.")
+            elseif action == "register" then
+                sendSystemToPlayer(playerUid, "[CHZZK] Channel registration requested. Check chat for the connection result.")
+            elseif action == "status" then
+                sendSystemToPlayer(playerUid, "[CHZZK] Checking channel connection status...")
+            else
+                sendSystemToPlayer(playerUid, "[CHZZK] Removing channel connection...")
+            end
+            return
+        end
+
+        local playerController = playerState:GetPlayerController()
+        if playerController == nil or not playerController.bAdmin then
+            log("Donation test rejected: sender is not an administrator.")
+            return
+        end
+
+        if normalizedCommand == "donationdebug" then
+            local pawn = playerController:GetPawn()
+            dumpCombatFunctions("Pawn", pawn)
+            if pawn ~= nil and pawn:IsValid() then
+                dumpCombatFunctions("CharacterParameterComponent", pawn.CharacterParameterComponent)
+            end
+            log("Combat-function dump complete. Check UE4SS.log for DonationMod candidates.")
+            return
+        end
+
+        local amount = tonumber(value)
+        if amount ~= 1000 and amount ~= 10000 and amount ~= 100000 then
+            log("Donation test rejected: supported amounts are 1000, 10000, and 100000.")
+            return
+        end
+
+        ExecuteInGameThread(function()
+            local ok, err = pcall(handleDonationRule, playerUid, amount)
+            if not ok then
+                log("Donation test failed: " .. tostring(err))
+            end
+        end)
+    end)
+end)
+
+if not donationChatCommandHookOk then
+    log("Donation chat command hook is unavailable: " .. tostring(donationChatCommandHookErr))
+end
+
+local function processDonation(playerId, amount, eventId)
+    local playerUid = { A = playerId, B = 0, C = 0, D = 0 }
+    if not ensureGameReferences() then
+        table.insert(pendingDonations, { playerId = playerId, amount = amount, eventId = eventId })
+        log("Donation queued until the server world is ready: " .. eventId)
+        return
+    end
+
+    local ok, err = pcall(handleDonationRule, playerUid, amount)
+    if not ok then
+        log("Failed to process donation " .. eventId .. ": " .. tostring(err))
+    end
+end
+
+local function dispatchDonation(playerId, amount, eventId)
+    ExecuteInGameThread(function()
+        processDonation(playerId, amount, eventId)
+    end)
+end
+
+local function flushPendingDonations()
+    local queuedDonations = pendingDonations
+    pendingDonations = {}
+
+    for _, donation in ipairs(queuedDonations) do
+        processDonation(donation.playerId, donation.amount, donation.eventId)
+    end
+end
+
+local function writePlayerStatus()
+    local statusFile = io.open(playerStatusPath, "w")
+    if statusFile == nil then
+        return
+    end
+
+    local players = FindAllOf("PalPlayerController") or {}
+    for _, player in pairs(players) do
+        local playerState = player:GetPalPlayerState()
+        if playerState ~= nil and playerState:IsValid() then
+            local name = playerState.PlayerNamePrivate:ToString():gsub("[\t\r\n]", " ")
+            statusFile:write(tostring(playerState.PlayerUId.A), "\t", name, "\n")
+        end
+    end
+    statusFile:close()
+end
+
+local function pollDonationQueue()
+    local queueFile = io.open(donationQueuePath, "r")
+    if queueFile == nil then
+        return
+    end
+
+    if donationQueueOffset == nil then
+        -- Ignore donation events from before this Lua mod instance started.
+        donationQueueOffset = queueFile:seek("end") or 0
+        queueFile:close()
+        log("Listening for donation events at: " .. donationQueuePath)
+        return
+    end
+
+    local queueLength = queueFile:seek("end") or 0
+    if donationQueueOffset > queueLength then
+        donationQueueOffset = 0
+    end
+    queueFile:seek("set", donationQueueOffset)
+
+    while true do
+        local line = queueFile:read("*l")
+        if line == nil then
+            break
+        end
+        donationQueueOffset = queueFile:seek()
+
+        local eventId, playerId, amount = line:match("^([^\t]+)\t(-?%d+)\t(%d+)$")
+        playerId = tonumber(playerId)
+        amount = tonumber(amount)
+        if eventId ~= nil and playerId ~= nil and amount ~= nil then
+            dispatchDonation(playerId, amount, eventId)
+        else
+            log("Ignoring malformed donation queue entry.")
+        end
+    end
+
+    queueFile:close()
+end
+
+local function pollStreamerRegistrationResponses()
+    local responseFile = io.open(streamerRegistrationResponsePath, "r")
+    if responseFile == nil then
+        return
+    end
+
+    if streamerRegistrationResponseOffset == nil then
+        streamerRegistrationResponseOffset = responseFile:seek("end") or 0
+        responseFile:close()
+        log("Listening for streamer registration responses at: " .. streamerRegistrationResponsePath)
+        return
+    end
+
+    local responseLength = responseFile:seek("end") or 0
+    if streamerRegistrationResponseOffset > responseLength then
+        streamerRegistrationResponseOffset = 0
+    end
+    responseFile:seek("set", streamerRegistrationResponseOffset)
+
+    while true do
+        local line = responseFile:read("*l")
+        if line == nil then
+            break
+        end
+        streamerRegistrationResponseOffset = responseFile:seek()
+
+        local requestId, rawPlayerId, status, responseMessage = line:match("^([^\t]+)\t(-?%d+)\t([^\t]+)\t(.*)$")
+        local playerId = tonumber(rawPlayerId)
+        if requestId ~= nil and playerId ~= nil and status ~= nil then
+            local playerUid = { A = playerId, B = 0, C = 0, D = 0 }
+            local text = "[CHZZK] " .. responseMessage
+            sendSystemToPlayer(playerUid, text)
+            log("Streamer registration response " .. status .. " for UID.A=" .. tostring(playerId) .. ": " .. responseMessage)
+        else
+            log("Ignoring malformed streamer registration response.")
+        end
+    end
+
+    responseFile:close()
+end
+
+LoopAsync(250, function()
+    local ok, err = pcall(pollDonationQueue)
+    if not ok then
+        log("Donation queue read failed: " .. tostring(err))
+    end
+    local registrationOk, registrationErr = pcall(pollStreamerRegistrationResponses)
+    if not registrationOk then
+        log("Streamer registration response read failed: " .. tostring(registrationErr))
+    end
+    playerStatusPollCount = playerStatusPollCount + 1
+    if playerStatusPollCount >= 20 then
+        playerStatusPollCount = 0
+        local statusOk, statusErr = pcall(writePlayerStatus)
+        if not statusOk then
+            log("Player status write failed: " .. tostring(statusErr))
+        end
+    end
+    if #pendingDonations > 0 then
+        ExecuteInGameThread(flushPendingDonations)
+    end
+    return false
+end)
+
+RegisterCustomEvent("Donation_Init", function(Context)
+    ModActor = Context:get()
+    log("DonationMod initialized!")
+    
+    if PalUtility == nil or not PalUtility:IsValid() then
+        PalUtility = StaticFindObject("/Script/Pal.Default__PalUtility")
+    end
+    if World == nil or not World:IsValid() then
+        World = FindFirstOf("World")
+    end
+
+    flushPendingDonations()
+end)
+
+local chatHookOk, chatHookErr = pcall(function()
+RegisterHook("/Script/Pal.PalPlayerState:EnterChat_Receive", function(Context, Chat)
+    if ModActor == nil or ModActor == DirectDonationActor or not ModActor:IsValid() then
+        return
+    end
+
+    local message = Chat:get().Message:ToString()
+    local cmd, rest = message:match("^!(%S+)%s*(.*)$")
+    if cmd == nil then
+        return
+    end
+
+    if PalUtility == nil or not PalUtility:IsValid() then
+        PalUtility = StaticFindObject("/Script/Pal.Default__PalUtility")
+    end
+    if World == nil or not World:IsValid() then
+        World = FindFirstOf("World")
+    end
+
+    local playerState = Context:get()
+    local playerUid = translateGuid(playerState.PlayerUId)
+    local playerController = playerState:GetPlayerController()
+    if not playerController.bAdmin then
+        PalUtility:SendSystemToPlayerChat(World, "권한이 없습니다!", playerUid)
+        return
+    end
+
+    cmd = cmd:lower()
+    if cmd == "공지" then
+        ModActor:Broadcast(rest)
+    elseif cmd == "api" or cmd == "give" then
+        local target, arg = rest:match("^(%S+)%s+(.*)$")
+        if target == nil then
+            PalUtility:SendSystemToPlayerChat(World, "대상이 올바르지 않습니다!", playerUid)
+            return
+        elseif target == "all" then
+            if cmd == "api" then
+                PalUtility:SendSystemToPlayerChat(World, "API는 전체 지급을 지원하지 않습니다!", playerUid)
+                return
+            end
+        elseif target ~= "me" then
+            local result = findPlayer(target)
+            if not result then
+                PalUtility:SendSystemToPlayerChat(World, "플레이어를 찾을 수 없습니다!", playerUid)
+                return
+            end
+            playerUid = translateGuid(result)
+        end
+
+        if cmd == "api" then
+            local amount = tonumber(arg)
+            if not amount then
+                return
+            end
+            handleDonationRule(playerUid, amount)
+        elseif cmd == "give" then
+            local id, count = arg:match("^(%S+)%s*(.*)$")
+            if not id then
+                return
+            end
+            id = FName(id)
+            count = tonumber(count)
+            if count == nil then
+                count = 1
+            end
+
+            if target == "all" then
+                ModActor:GiveAll(id, count)
+            else
+                ModActor:GiveItem(playerUid, id, count)
+            end
+        end
+    end
+end)
+end)
+
+if not chatHookOk then
+    log("Chat command hook is unavailable in this Palworld version: " .. tostring(chatHookErr))
+end
+
+RegisterConsoleCommandGlobalHandler("DonationDumpBindings", function()
+    if type(GenerateLuaTypes) ~= "function" then
+        log("GenerateLuaTypes is unavailable in this UE4SS build.")
+        return true
+    end
+
+    log("Generating Palworld Lua bindings. This may take a moment.")
+    local ok, err = pcall(GenerateLuaTypes)
+    if ok then
+        log("Lua binding dump requested. Check Mods\\shared\\types after it completes.")
+    else
+        log("Lua binding dump failed: " .. tostring(err))
+    end
+    return true
+end)
+
+local function consumeBindingDumpRequest()
+    local request = io.open(bindingDumpRequestPath, "r")
+    if request == nil then
+        return
+    end
+    request:close()
+    os.remove(bindingDumpRequestPath)
+
+    log("Binding-dump request found; starting type generation.")
+    ExecuteInGameThread(function()
+        if type(GenerateLuaTypes) ~= "function" then
+            log("GenerateLuaTypes is unavailable in this UE4SS build.")
+            return
+        end
+
+        local ok, err = pcall(GenerateLuaTypes)
+        if ok then
+            log("Lua binding dump requested. Check Mods\\shared\\types after it completes.")
+        else
+            log("Lua binding dump failed: " .. tostring(err))
+        end
+    end)
+end
+
+consumeBindingDumpRequest()
+log("DonationMod loaded! Run DonationDumpBindings from the server console to generate Lua types.")
