@@ -21,6 +21,23 @@ math.randomseed(os.time())
 
 local serverTerminalOutput = nil
 local serverTerminalChecked = false
+local serverTerminalUtf8Checked = false
+
+local function requestServerTerminalUtf8()
+    -- Lua has no direct Win32 SetConsoleOutputCP binding.  `chcp` changes the
+    -- shared console's code page, so calling it from a short child process
+    -- also affects this dedicated-server console before we write Korean text.
+    if serverTerminalUtf8Checked then
+        return
+    end
+    serverTerminalUtf8Checked = true
+
+    pcall(function()
+        if os ~= nil and type(os.execute) == "function" then
+            os.execute("chcp 65001 >nul 2>&1")
+        end
+    end)
+end
 
 local function writeToServerTerminal(line)
     -- UE4SS print() writes to its debug console/log.  Dedicated-server users
@@ -28,6 +45,7 @@ local function writeToServerTerminal(line)
     -- once and mirror each DonationMod line there as well.
     if not serverTerminalChecked then
         serverTerminalChecked = true
+        requestServerTerminalUtf8()
         local openOk, outputOrErr = pcall(function()
             return io.open("CONOUT$", "w")
         end)
