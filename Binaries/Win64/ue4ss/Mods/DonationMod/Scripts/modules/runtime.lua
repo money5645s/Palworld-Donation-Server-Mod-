@@ -19,9 +19,48 @@ streamerRegistrationSequence = 0
 -- Seed the random generator
 math.randomseed(os.time())
 
-function log(message)
-    print(string.format("[DonationMod] %s\n", message))
+local serverTerminalOutput = nil
+local serverTerminalChecked = false
+
+local function writeToServerTerminal(line)
+    -- UE4SS print() writes to its debug console/log.  Dedicated-server users
+    -- normally watch the Windows terminal instead, so open its CONOUT$ device
+    -- once and mirror each DonationMod line there as well.
+    if not serverTerminalChecked then
+        serverTerminalChecked = true
+        local openOk, outputOrErr = pcall(function()
+            return io.open("CONOUT$", "w")
+        end)
+        if openOk and outputOrErr ~= nil then
+            serverTerminalOutput = outputOrErr
+        end
+    end
+
+    local terminalOk = false
+    if serverTerminalOutput ~= nil then
+        terminalOk = pcall(function()
+            serverTerminalOutput:write(line .. "\r\n")
+            serverTerminalOutput:flush()
+        end)
+    end
+
+    -- Some server launchers redirect CONOUT$ but preserve stdout.  Try that
+    -- only when the direct console device was unavailable.
+    if not terminalOk and io ~= nil and io.stdout ~= nil then
+        pcall(function()
+            io.stdout:write(line .. "\r\n")
+            io.stdout:flush()
+        end)
+    end
 end
+
+function log(message)
+    local line = string.format("[DonationMod] %s", tostring(message))
+    print(line .. "\n")
+    writeToServerTerminal(line)
+end
+
+log("터미널 로그 미러를 활성화했습니다.")
 
 function translateGuid(Userdata)
     local self = {}
