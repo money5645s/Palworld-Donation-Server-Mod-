@@ -19,18 +19,31 @@ local function dumpCombatFunctions(label, object)
     end)
 end
 
+-- CHZZK listener commands:
+--   !czr <channel id>  register
+--   !czs               show connection status
+--   !czu               unregister
+-- The former long names remain as compatibility aliases.
+local chzzkCommandActions = {
+    czr = "register",
+    czs = "status",
+    czu = "unregister",
+    chzzkregister = "register",
+    chzzkstatus = "status",
+    chzzkunregister = "unregister",
+}
+
 local donationChatCommandHookOk, donationChatCommandHookErr = pcall(function()
     RegisterHook("/Script/Pal.PalGameStateInGame:BroadcastChatMessage", function(_, ChatMessage)
         local chat = ChatMessage:get()
         local message = chat.Message:ToString()
         local command, value = message:match("^!(%S+)%s*(.*)$")
         local normalizedCommand = command and command:lower()
+        local chzzkAction = chzzkCommandActions[normalizedCommand]
         if normalizedCommand ~= "done"
             and normalizedCommand ~= "donationtest"
             and normalizedCommand ~= "donationdebug"
-            and normalizedCommand ~= "chzzkregister"
-            and normalizedCommand ~= "chzzkstatus"
-            and normalizedCommand ~= "chzzkunregister" then
+            and chzzkAction == nil then
             return
         end
 
@@ -41,11 +54,8 @@ local donationChatCommandHookOk, donationChatCommandHookErr = pcall(function()
             return
         end
 
-        if normalizedCommand == "chzzkregister"
-            or normalizedCommand == "chzzkstatus"
-            or normalizedCommand == "chzzkunregister" then
-            local action = normalizedCommand == "chzzkregister" and "register"
-                or (normalizedCommand == "chzzkstatus" and "status" or "unregister")
+        if chzzkAction ~= nil then
+            local action = chzzkAction
             local playerName = playerState.PlayerNamePrivate:ToString()
             local requestId, requestErr = queueStreamerRegistrationRequest(action, playerUid, playerName, value)
             if requestId == nil then
